@@ -1,79 +1,110 @@
 require("dotenv").config();
-const express= require("express")
-const cors= require("cors")
-const bodyParser= require("body-parser")
-const {Kafka}= require("kafkajs")
-const connectDB = require("./db")
-const router = require("./routes/authRoutes")
-
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const { Kafka } = require("kafkajs");
+const connectDB = require("./db");
+const router = require("./routes/authRoutes");
+const WebSocket = require("ws");
 
 const app = express();
-const PORT = process.env.PORT||5000
+const PORT = process.env.PORT || 5000;
 
+// WebSocket сервер
+const wss = new WebSocket.Server({ port: 8080 });
 
-connectDB()
-// подключаем middlewares
+connectDB();
+
+// Подключаем middlewares
 app.use(cors({ origin: "*" }));
-app.use(bodyParser.json())
+app.use(bodyParser.json());
 
 app.use("/auth", router);
 
-// иницализация Kafka 
-
-const kafka= new Kafka({
-
+// Инициализация Kafka
+const kafka = new Kafka({
     clientId: process.env.KAFKA_CLIENT_ID,
     brokers: [process.env.KAFKA_BROKER],
 });
 
 const producer = kafka.producer();
-const consumer = kafka.consumer ({
-    groupId : "chat-group"
+const consumer = kafka.consumer({
+    groupId: "chat-group",
 });
 
-//функция для запуска kafka
-
-const runKafka = async()=>{
+// Функция для запуска Kafka
+const runKafka = async () => {
     await producer.connect();
     await consumer.connect();
     await consumer.subscribe({
-        topic:process.env.KAFKA_TOPIC,
-        fromBeginning:true
-    })
+        topic: process.env.KAFKA_TOPIC,
+        fromBeginning: true,
+    });
     consumer.run({
-        eachMessage:async({topic,partition, message})=>{
-            console.log(`Полученно сообщение: ${message.value.toString()}`);
+        eachMessage: async ({ topic, partition, message }) => {
+            console.log(`Получено сообщение: ${message.value.toString()}`);
         },
     });
 };
 
-// запускаем kafka при старте сервера
-
+// Запускаем Kafka при старте сервера
 runKafka().catch(console.error);
 
+// Обработка WebSocket соединений
+wss.on("connection", (ws) => {
+    console.log("Новое WebSocket соединение");
 
-app.get("/",(req,res)=>{
-    res.send("СЕРВЕР РАБОТАЕТ!")
-})
+    // Получаем имя пользователя от клиента
+    ws.on("message", (username) => {
+        console.log(`Пользователь ${username} подключен`);
 
-app.listen(PORT,()=>{
-    console.log(`Сервер запущен на http://localhost:${PORT}`)
+        // Создаем consumer для этого пользователя
+        const userConsumer = kafka.consumer({ groupId: `user_${username}` });
+        userConsumer.connect().then(() => {
+            userConsumer.subscribe({ topic: `user_${username}`, fromBeginning: true });
+            userConsumer.run({
+                eachMessage: async ({ topic, partition, message }) => {
+                    // Отправляем сообщение клиенту через WebSocket
+                    ws.send(message.value.toString());
+                },
+            });
+        });
+
+        // Обработка закрытия соединения
+        ws.on("close", () => {
+            console.log(`Пользователь ${username} отключен`);
+            userConsumer.disconnect();
+        });
+    });
 });
 
-app.post("/send", async(req,res)=>{
-    const{message}=req.body;
-    if(!message){
-        return res.status(400).json({error:"Сообщение не может быть пустым"})
+// Роут для отправки сообщений
+app.post("/send", async (req, res) => {
+    const { from, to, message, encryptedMessage, keys } = req.body;
+    if (!from || !to || !message || !encryptedMessage || !keys) {
+        return res.status(400).json({ error: "Необходимо указать все поля сообщения" });
     }
-    try{
+    try {
         await producer.send({
-            topic:process.env.KAFKA_TOPIC,
-            messages: [{value:message}],
+            topic: `user_${to}`,
+            messages: [{ 
+                value: JSON.stringify({ 
+                    from, 
+                    message,
+                    encryptedMessage,
+                    keys,
+                    timestamp: new Date().toLocaleTimeString()
+                }) 
+            }],
         });
-        res.json({success:true, message:"Сообщение отправлено в Kafka"});
-    }catch(error){
-        console.error("Ошибка при отправки",error);
-        res.status(500).json({error:"Ошибка при отправки сообщения(сервер)"})
+        res.json({ success: true, message: "Сообщение отправлено" });
+    } catch (error) {
+        console.error("Ошибка при отправке сообщения", error);
+        res.status(500).json({ error: "Ошибка при отправке сообщения" });
     }
+});
 
+// Запуск сервера
+app.listen(PORT, () => {
+    console.log(`Сервер запущен на http://localhost:${PORT}`);
 });
